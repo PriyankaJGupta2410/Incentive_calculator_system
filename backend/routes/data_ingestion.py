@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form
+from fastapi import APIRouter, UploadFile, File, Form,HTTPException
 from datetime import datetime
 import csv
 import io
@@ -155,14 +155,17 @@ async def upload_sales_data(
         message="Sales data ingested successfully"
     )
 
-@data_ingestion_router.post("/upload_structured_rule",response_model=RuleUploadResponse)
+@data_ingestion_router.post("/upload_structured_rule")
 async def upload_structured_rule(
     file: UploadFile = File(...),
     uploaded_by: str = Form(...)
 ):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+
     content = await file.read()
 
-    # Save raw CSV
+    # ---- Save raw CSV ----
     file_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
     with open(file_path, "wb") as f:
         f.write(content)
@@ -181,33 +184,43 @@ async def upload_structured_rule(
         (file.filename, uploaded_by)
     )
     upload_id = db.lastrowid
+    conn.commit()
 
-    for csv_row_number, row in enumerate(reader, start=2):
+    for csv_row_number, raw_row in enumerate(reader, start=2):
         total_rows += 1
 
         try:
-            # ---- Required Fields ----
-            rule_id = row["rule_id"].strip()
-            role = row["role"].strip()
-            vehicle_type = row["vehicle_type"].strip()
+            # ---- INTERNAL CSV FIELD MAPPING ----
+            rule_id = raw_row.get("Rule_ID", "").strip()
+            role = raw_row.get("Role", "").strip()
+            vehicle_type = raw_row.get("Vehicle_Type", "").strip()
 
-            min_qty = int(row["min_qty"])
-            max_qty = int(row["max_qty"])
-            priority = int(row["priority"])
+            min_qty = int(raw_row.get("Min_Units", 0))
+            max_qty = int(raw_row.get("Max_Units", 0))
 
-            base_amount = float(row["base_amount"])
-            per_unit_amount = float(row["per_unit_amount"])
+            base_amount = float(raw_row.get("Incentive_Amount_INR", 0))
+            per_unit_amount = float(raw_row.get("Bonus_Per_Unit_INR", 0))
 
-            valid_from = structured_parse_date(row["valid_from"])
-            print(" valid_from:",valid_from)
-            valid_to = structured_parse_date(row["valid_to"])
-            print(" valid_to:",valid_to)
+            valid_from = parse_date(raw_row.get("Valid_From", ""))
+            valid_to = parse_date(raw_row.get("Valid_To", ""))
+
+            # ---- Auto priority: higher slab = higher priority ----
+            priority = max_qty
 
             # ---- Validations ----
+            if not rule_id or not role or not vehicle_type:
+                raise ValueError("Missing required text fields")
+
+            if min_qty <= 0 or max_qty <= 0:
+                raise ValueError("Invalid quantity values")
+
             if min_qty > max_qty:
                 raise ValueError("min_qty cannot be greater than max_qty")
 
-            if not valid_from or not valid_to or valid_from > valid_to:
+            if not valid_from or not valid_to:
+                raise ValueError("Invalid date format")
+
+            if valid_from > valid_to:
                 raise ValueError("Invalid date range")
 
             # ---- Save version snapshot ----
@@ -217,7 +230,7 @@ async def upload_structured_rule(
                 (rule_id, rule_snapshot, upload_id)
                 VALUES (%s,%s,%s)
                 """,
-                (rule_id, json.dumps(row), upload_id)
+                (rule_id, json.dumps(raw_row), upload_id)
             )
 
             # ---- Insert rule ----
@@ -244,7 +257,6 @@ async def upload_structured_rule(
 
         except Exception as e:
             invalid_rows += 1
-            # (optional) log errors in rule_error table
 
     # ---- Update upload summary ----
     db.execute(
@@ -260,12 +272,12 @@ async def upload_structured_rule(
 
     conn.commit()
 
-    return RuleUploadResponse(
-        status="SUCCESS",
-        file_name=file.filename,
-        uploaded_by=uploaded_by,
-        total_rows=total_rows,
-        valid_rows=valid_rows,
-        invalid_rows=invalid_rows,
-        message="Structured incentive rules uploaded successfully"
-    )
+    return {
+        "status": "SUCCESS",
+        "file_name": file.filename,
+        "uploaded_by": uploaded_by,
+        "total_rows": total_rows,
+        "valid_rows": valid_rows,
+        "invalid_rows": invalid_rows,
+        "message": "Structured incentive rules uploaded successfully"
+    }
