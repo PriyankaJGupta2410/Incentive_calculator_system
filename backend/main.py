@@ -17,9 +17,13 @@ app.add_middleware(
 
 ########################## IMPORT ROUTES #################
 from routes.data_ingestion import data_ingestion_router
+from routes.calculator import calculator_router
+from routes.results import results_router
 
 ################### Declar Routes ####################
 app.include_router(data_ingestion_router, prefix="/data-ingestion")
+app.include_router(calculator_router, prefix="/calculator")
+app.include_router(results_router, prefix="/results")
 
 @app.get("/")
 async def index():

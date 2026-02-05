@@ -1,11 +1,10 @@
+import shutil
+from pydantic import ValidationError
 from fastapi import APIRouter, UploadFile, File, Form,HTTPException
-from datetime import datetime
-import csv
-import io
 import os
-import json
+import pandas as pd
 from dotenv import load_dotenv
-from models import SalesUploadResponse,RuleUploadResponse
+from models import SalesRowSchema,RuleRowSchema
 from database import db,conn
 
 load_dotenv()
@@ -15,269 +14,207 @@ data_ingestion_router = APIRouter()
 UPLOAD_DIRECTORY = "uploads"
 os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
 ############################ API ROUTES FOR DATA INGESTION #########################
-def parse_date(date_str):
-    if not date_str:
-        return None
+@data_ingestion_router.post("/upload_sales_data")
+async def upload_sales_data(file: UploadFile = File(...)):
+    try:
+        file_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-    date_str = str(date_str).strip()  # 🔥 IMPORTANT
+        df = pd.read_csv(file_path)
 
-    formats = [
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-        "%Y-%m-%d",
-    ]
+        REQUIRED_SALES_COLUMNS = ["Employee_ID", "Branch", "Role", "Vehicle_Model", "Quantity", "Sale_Date", "Vehicle_Type"]
 
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt).date()
-        except ValueError:
-            continue
-
-    return None
-
-def structured_parse_date(date_str):
-    if not date_str:
-        return None
-
-    # Remove spaces, BOM, hidden chars
-    date_str = str(date_str).strip().replace("\ufeff", "")
-
-    formats = [
-        "%d-%m-%Y",  # 01-09-2025
-        "%d/%m/%Y",  # 01/09/2025
-        "%Y-%m-%d",  # 2025-09-01
-    ]
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(date_str, fmt).date()
-        except ValueError:
-            continue
-
-    return None
-
-
-@data_ingestion_router.post("/upload_sales_data",response_model=SalesUploadResponse)
-async def upload_sales_data(
-    file: UploadFile = File(...),
-    uploaded_by: str = Form(...)
-):
-    content = await file.read()
-
-    # Save raw CSV
-    file_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
-
-    total_rows = 0
-    valid_rows = 0
-    invalid_rows = 0
-
-    for row_number, row in enumerate(reader, start=1):
-        total_rows += 1
-
-        employee_id = row.get("Employee_ID")
-        vehicle_type = row.get("Vehicle_Type")
-        quantity = row.get("Quantity")
-        sale_date = row.get("Sale_Date", "").strip()
-
-        # ---------- Validation ----------
-        if not employee_id or not vehicle_type or not quantity:
-            invalid_rows += 1
-            db.execute(
-                "INSERT INTO sales_upload_errors (csv_row_number, error_message, raw_data) VALUES (%s,%s,%s)",
-                (row_number, "Missing required fields", json.dumps(row))
+        missing_cols = [col for col in REQUIRED_SALES_COLUMNS if col not in df.columns]
+        if missing_cols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing columns: {missing_cols}"
             )
-            continue
 
-        try:
-            quantity = int(quantity)
-            if quantity <= 0:
-                raise ValueError
-        except:
-            invalid_rows += 1
-            db.execute(
-                "INSERT INTO sales_upload_errors (csv_row_number , error_message, raw_data) VALUES (%s,%s,%s)",
-                (row_number, "Invalid quantity", json.dumps(row))
-            )
-            continue
+        success_count = 0
+        failed_rows = []
 
-        parsed_date = parse_date(sale_date)
-        if not parsed_date:
-            invalid_rows += 1
-            db.execute(
-                "INSERT INTO sales_upload_errors (csv_row_number, error_message, raw_data) VALUES (%s,%s,%s)",
-                (row_number, "Invalid date format (DD-MM-YYYY)", json.dumps(row))
-            )
-            continue
+        for index, row in df.iterrows():
+            try:
+                # 🔹 Convert CSV row to dict
+                row_dict = row.to_dict()
 
-        # ---------- Insert Valid Record ----------
-        db.execute("""
-            INSERT INTO sales_transactions
-            (employee_id, branch, role, vehicle_model, vehicle_type, quantity, sale_date)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            employee_id,
-            row.get("Branch"),
-            row.get("Role"),
-            row.get("Vehicle_Model"),
-            vehicle_type,
-            quantity,
-            parsed_date
-        ))
+                # 🔹 Pydantic validation
+                sales_data = SalesRowSchema(**row_dict)
 
-        valid_rows += 1
+                # Insert salesperson
+                db.execute(
+                    "SELECT id FROM salespeople WHERE id = %s",
+                    (sales_data.Employee_ID,)
+                )
+                if not db.fetchone():
+                    db.execute(
+                        """
+                        INSERT INTO salespeople (id, branch, role)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (
+                            sales_data.Employee_ID,
+                            sales_data.Branch,
+                            sales_data.Role
+                        )
+                    )
 
-    # ---------- Upload Log ----------
-    db.execute("""
-        INSERT INTO sales_upload_logs
-        (file_name, uploaded_by, total_rows, valid_rows, invalid_rows)
-        VALUES (%s,%s,%s,%s,%s)
-    """, (
-        file.filename,
-        uploaded_by,
-        total_rows,
-        valid_rows,
-        invalid_rows
-    ))
+                # Insert sales record
+                db.execute(
+                    """
+                    INSERT INTO sales_records
+                    (employee_id, vehicle_model, quantity, sale_date, vehicle_type)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        sales_data.Employee_ID,
+                        sales_data.Vehicle_Model,
+                        sales_data.Quantity,
+                        sales_data.Sale_Date,
+                        sales_data.Vehicle_Type
+                    )
+                )
 
-    conn.commit()
+                success_count += 1
 
-    return SalesUploadResponse(
-        status="SUCCESS",
-        file_name=file.filename,
-        uploaded_by=uploaded_by,
-        total_rows=total_rows,
-        valid_rows=valid_rows,
-        invalid_rows=invalid_rows,
-        message="Sales data ingested successfully"
-    )
+            except ValidationError as ve:
+                failed_rows.append({
+                    "row": index + 1,
+                    "error": ve.errors()
+                })
+                continue
+
+        conn.commit()
+
+        return {
+            "status": "success",
+            "processed": success_count,
+            "failed": len(failed_rows),
+            "failed_rows": failed_rows
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @data_ingestion_router.post("/upload_structured_rule")
-async def upload_structured_rule(
-    file: UploadFile = File(...),
-    uploaded_by: str = Form(...)
-):
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files allowed")
+async def upload_structured_rule(file: UploadFile = File(...)):
+    try:
+        # -----------------------------
+        # 1. Save uploaded file
+        # -----------------------------
+        file_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-    content = await file.read()
+        # -----------------------------
+        # 2. Read CSV
+        # -----------------------------
+        df = pd.read_csv(file_path)
 
-    # ---- Save raw CSV ----
-    file_path = os.path.join(UPLOAD_DIRECTORY, file.filename)
-    with open(file_path, "wb") as f:
-        f.write(content)
+        # -----------------------------
+        # 3. Validate required columns
+        # -----------------------------
+        REQUIRED_RULE_COLUMNS = [
+            "Rule_ID",
+            "Role",
+            "Vehicle_Type",
+            "Min_Units",
+            "Max_Units",
+            "Incentive_Amount_INR",
+            "Bonus_Per_Unit_INR",
+            "Valid_From",
+            "Valid_To"
+        ]
 
-    reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
-
-    total_rows = valid_rows = invalid_rows = 0
-
-    # ---- Create upload record ----
-    db.execute(
-        """
-        INSERT INTO incentive_rule_uploads
-        (file_name, uploaded_by, total_rows, valid_rows, invalid_rows)
-        VALUES (%s,%s,0,0,0)
-        """,
-        (file.filename, uploaded_by)
-    )
-    upload_id = db.lastrowid
-    conn.commit()
-
-    for csv_row_number, raw_row in enumerate(reader, start=2):
-        total_rows += 1
-
-        try:
-            # ---- INTERNAL CSV FIELD MAPPING ----
-            rule_id = raw_row.get("Rule_ID", "").strip()
-            role = raw_row.get("Role", "").strip()
-            vehicle_type = raw_row.get("Vehicle_Type", "").strip()
-
-            min_qty = int(raw_row.get("Min_Units", 0))
-            max_qty = int(raw_row.get("Max_Units", 0))
-
-            base_amount = float(raw_row.get("Incentive_Amount_INR", 0))
-            per_unit_amount = float(raw_row.get("Bonus_Per_Unit_INR", 0))
-
-            valid_from = parse_date(raw_row.get("Valid_From", ""))
-            valid_to = parse_date(raw_row.get("Valid_To", ""))
-
-            # ---- Auto priority: higher slab = higher priority ----
-            priority = max_qty
-
-            # ---- Validations ----
-            if not rule_id or not role or not vehicle_type:
-                raise ValueError("Missing required text fields")
-
-            if min_qty <= 0 or max_qty <= 0:
-                raise ValueError("Invalid quantity values")
-
-            if min_qty > max_qty:
-                raise ValueError("min_qty cannot be greater than max_qty")
-
-            if not valid_from or not valid_to:
-                raise ValueError("Invalid date format")
-
-            if valid_from > valid_to:
-                raise ValueError("Invalid date range")
-
-            # ---- Save version snapshot ----
-            db.execute(
-                """
-                INSERT INTO incentive_rule_versions
-                (rule_id, rule_snapshot, upload_id)
-                VALUES (%s,%s,%s)
-                """,
-                (rule_id, json.dumps(raw_row), upload_id)
+        missing_cols = [col for col in REQUIRED_RULE_COLUMNS if col not in df.columns]
+        if missing_cols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing columns: {missing_cols}"
             )
 
-            # ---- Insert rule ----
-            db.execute(
-                """
-                INSERT INTO incentive_rules
-                (rule_id, role, vehicle_type,
-                 min_qty, max_qty,
-                 base_amount, per_unit_amount,
-                 valid_from, valid_to,
-                 priority, upload_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    rule_id, role, vehicle_type,
-                    min_qty, max_qty,
-                    base_amount, per_unit_amount,
-                    valid_from, valid_to,
-                    priority, upload_id
+        success_count = 0
+        failed_rows = []
+
+        # -----------------------------
+        # 4. Process rows
+        # -----------------------------
+        for index, row in df.iterrows():
+            try:
+                row_dict = row.to_dict()
+
+                # Pydantic validation
+                rule_data = RuleRowSchema(**row_dict)
+
+                # Check if rule already exists
+                db.execute(
+                    "SELECT id FROM incentive_rules WHERE id = %s",
+                    (rule_data.Rule_ID,)
                 )
-            )
+                if db.fetchone():
+                    continue  # Skip existing rule
 
-            valid_rows += 1
+                # Insert rule
+                db.execute(
+                    """
+                    INSERT INTO incentive_rules
+                    (
+                        id,
+                        role,
+                        vehicle_type,
+                        min_units,
+                        max_units,
+                        incentive_amount,
+                        bonus_per_unit,
+                        valid_from,
+                        valid_to,
+                        rule_type
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        rule_data.Rule_ID,
+                        rule_data.Role,
+                        rule_data.Vehicle_Type,
+                        rule_data.Min_Units,
+                        rule_data.Max_Units,
+                        rule_data.Incentive_Amount_INR,
+                        rule_data.Bonus_Per_Unit_INR,
+                        rule_data.Valid_From,
+                        rule_data.Valid_To,
+                        "Structured"
+                    )
+                )
 
-        except Exception as e:
-            invalid_rows += 1
+                success_count += 1
 
-    # ---- Update upload summary ----
-    db.execute(
-        """
-        UPDATE incentive_rule_uploads
-        SET total_rows=%s,
-            valid_rows=%s,
-            invalid_rows=%s
-        WHERE id=%s
-        """,
-        (total_rows, valid_rows, invalid_rows, upload_id)
-    )
+            except ValidationError as ve:
+                failed_rows.append({
+                    "row": index + 1,
+                    "error": ve.errors()
+                })
+                continue
 
-    conn.commit()
+            except Exception as e:
+                failed_rows.append({
+                    "row": index + 1,
+                    "error": str(e)
+                })
+                continue
 
-    return {
-        "status": "SUCCESS",
-        "file_name": file.filename,
-        "uploaded_by": uploaded_by,
-        "total_rows": total_rows,
-        "valid_rows": valid_rows,
-        "invalid_rows": invalid_rows,
-        "message": "Structured incentive rules uploaded successfully"
-    }
+        # -----------------------------
+        # 5. Commit DB
+        # -----------------------------
+        conn.commit()
+
+        return {
+            "status": "success",
+            "processed": success_count,
+            "failed": len(failed_rows),
+            "failed_rows": failed_rows
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

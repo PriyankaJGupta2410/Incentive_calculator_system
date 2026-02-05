@@ -1,35 +1,43 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import date
 from typing import Optional
 
-class SalesRecord(BaseModel):
+class SalesRowSchema(BaseModel):
+    Employee_ID: str = Field(..., min_length=1)
+    Branch: str
+    Role: str
+    Vehicle_Model: str
+    Quantity: int = Field(..., gt=0)
+    Sale_Date: date
+    Vehicle_Type: str
+
+class RuleRowSchema(BaseModel):
+    Rule_ID: str
+    Role: str
+    Vehicle_Type: str
+    Min_Units: int
+    Max_Units: int
+    Incentive_Amount_INR: float
+    Bonus_Per_Unit_INR: float
+    Valid_From: date
+    Valid_To: date
+
+class IncentiveCalculationRequest(BaseModel):
+    period: str = Field(example="2025-09")
+
+class CalculationResultSchema(BaseModel):
     employee_id: str
-    branch: Optional[str]
-    role: Optional[str]
-    vehicle_model: Optional[str]
-    vehicle_type: str
-    quantity: int
-    sale_date: date
-
-
-class SalesUploadResponse(BaseModel):
+    period_month: str
+    total_incentive: float
+    breakdown_json: str
     status: str
-    file_name: str
-    uploaded_by: str
-    total_rows: int
-    valid_rows: int
-    invalid_rows: int
-    message: str
 
-class RuleUploadResponse(BaseModel):
-    status: str                    # SUCCESS / FAILED
-    file_name: str
-    uploaded_by: str
+    class Config:
+        from_attributes = True
 
-    total_rows: int
-    valid_rows: int
-    invalid_rows: int
 
-    upload_id: Optional[int] = None
-
-    message: str
+class CalculationStatsSchema(BaseModel):
+    total_incentive: float
+    total_salespeople: int
+    avg_incentive: float
+    top_performer: Optional[str]
